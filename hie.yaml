@@ -1,0 +1,7 @@
+cradle:
+  cabal:
+    - path: "src"
+      component: "lib:delta-stepping"
+
+    - path: "test"
+      component: "delta-stepping:test:delta-stepping"

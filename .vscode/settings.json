@@ -1,0 +1,10 @@
+{
+  "haskell.manageHLS": "GHCup",
+  "haskell.toolchain": {
+    // Setting this to 'null' prevents the extension from asking about installing
+    // stack (nobody here needs stack, the extension just happily asks the user
+    // to first install the world, and only afterwards starts checking what it
+    // actually needs).
+    "stack": null
+  }
+}
