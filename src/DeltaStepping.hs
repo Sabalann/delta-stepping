@@ -137,14 +137,38 @@ step
     -> TentativeDistances
     -> IO ()
 step verbose threadCount graph delta buckets distances = do
-  -- In this function, you need to implement the body of the outer while loop,
-  -- which contains another while loop.
-  -- See function 'deltaStepping' for inspiration on implementing a while loop
-  -- in a functional language.
-  -- For debugging purposes, you may want to place:
-  --   printVerbose verbose "inner step" graph delta buckets distances
-  -- in the inner loop.
-  undefined
+    -- Find the smallest non-empty bucket
+    bucketIndex <- findNextBucket buckets
+
+    -- Read and clear the current bucket
+    currentBucket <- V.read (bucketArray buckets) (bucketIndex `mod` V.length (bucketArray buckets))
+    V.write (bucketArray buckets) (bucketIndex `mod` V.length (bucketArray buckets)) Set.empty
+
+    -- Relax light edges
+    let lightPredicate = (<= delta)
+    lightRequests <- findRequests threadCount lightPredicate graph currentBucket distances
+    relaxRequests threadCount buckets distances delta lightRequests
+
+    -- Relax heavy edges
+    let heavyPredicate = (> delta)
+    heavyRequests <- findRequests threadCount heavyPredicate graph currentBucket distances
+    relaxRequests threadCount buckets distances delta heavyRequests
+
+    -- Update the first bucket index if necessary
+    updateFirstBucketIndex buckets
+
+    -- Print the verbose output, if enabled
+    when verbose $ printCurrentBucket graph delta buckets distances
+
+
+updateFirstBucketIndex :: Buckets -> IO ()
+updateFirstBucketIndex Buckets { firstBucket = firstBucket, bucketArray = bucketArray } = do
+    let bucketCount = V.length bucketArray -- Pure length calculation
+    forM_ [0 .. bucketCount - 1] $ \i -> do
+        bucket <- V.read bucketArray i
+        unless (Set.null bucket) $ writeIORef firstBucket i
+
+
 
 
 -- Once all buckets are empty, the tentative distances are finalised and the
@@ -243,10 +267,28 @@ relaxRequests threadCount buckets distances delta req = do
 relax :: Buckets
       -> TentativeDistances
       -> Distance
-      -> (Node, Distance) -- (w, x) in the paper
+      -> (Node, Distance) -- (node, newDistance)
       -> IO ()
-relax buckets distances delta (node, newDistance) = do
-  undefined
+relax Buckets { firstBucket = firstBucket, bucketArray = bucketArray } distances delta (node, newDistance) = do
+    -- Read the current distance of the node
+    currentDistance <- M.read distances node
+
+    -- Check if the new distance is smaller
+    when (newDistance < currentDistance) $ do
+        -- Update the tentative distance
+        M.write distances node newDistance
+
+        -- Compute the new bucket index
+        let newBucketIndex = floor (newDistance / delta)
+
+        -- Remove the node from its current bucket (if applicable)
+        let currentBucketIndex = floor (currentDistance / delta)
+        when (not $ isInfinite currentDistance) $ do
+            V.modify bucketArray (Set.delete node) (currentBucketIndex `mod` V.length bucketArray)
+
+        -- Add the node to the new bucket
+        V.modify bucketArray (Set.insert node) (newBucketIndex `mod` V.length bucketArray)
+
 
 
 -- -----------------------------------------------------------------------------
