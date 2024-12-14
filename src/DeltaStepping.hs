@@ -11,6 +11,8 @@
 -- https://cs.iupui.edu/~fgsong/LearnHPC/sssp/deltaStep.html
 --
 
+
+
 module DeltaStepping (
 
   Graph, Node, Distance,
@@ -102,8 +104,25 @@ initialise
     -> Distance
     -> Node
     -> IO (Buckets, TentativeDistances)
-initialise graph delta source = do
-  undefined
+initialise graph _ source = do
+    -- Create the distances vector and initialize to infinity
+    let numNodes = G.order graph
+    distances <- M.replicate numNodes infinity
+    M.write distances source 0 -- Distance to the source is 0
+
+    -- Create the bucket array (cyclic buckets)
+    let bucketCount = numNodes `div` 10 + 1 -- Arbitrary choice for bucket count
+    bucketArray <- V.replicate bucketCount Set.empty
+
+    -- Add the source node to the first bucket
+    V.modify bucketArray (Set.insert source) 0
+
+    -- Initialize the firstBucket reference
+    firstBucket <- newIORef 0
+
+    -- Return the initial state
+    return (Buckets { firstBucket = firstBucket, bucketArray = bucketArray }, distances)
+
 
 
 -- Take a single step of the algorithm.
@@ -132,16 +151,31 @@ step verbose threadCount graph delta buckets distances = do
 -- algorithm terminates.
 --
 allBucketsEmpty :: Buckets -> IO Bool
-allBucketsEmpty buckets = do
-  undefined
+allBucketsEmpty Buckets { firstBucket = firstBucket, bucketArray = bucketArray } = do
+    -- Read through the bucket array
+    bucketList <- mapM (V.read bucketArray) [0 .. V.length bucketArray - 1]
+    -- Check if all IntSets are empty
+    return $ all Set.null bucketList
+
 
 
 -- Return the index of the smallest on-empty bucket. Assumes that there is at
 -- least one non-empty bucket remaining.
 --
 findNextBucket :: Buckets -> IO Int
-findNextBucket buckets = do
-  undefined
+findNextBucket Buckets { firstBucket = firstBucket, bucketArray = bucketArray } = do
+    start <- readIORef firstBucket
+    let bucketCount = V.length bucketArray
+    let indices = [start .. start + bucketCount - 1] -- Cyclic indices
+    -- Find the first non-empty bucket
+    let findIndex [] = error "No non-empty buckets found!" -- Safety check
+        findIndex (i:is) = do
+            bucket <- V.read bucketArray (i `mod` bucketCount)
+            if Set.null bucket
+                then findIndex is
+                else return i
+    findIndex indices
+
 
 
 -- Create requests of (node, distance) pairs that fulfil the given predicate
@@ -154,7 +188,30 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph v' distances = do
-  undefined
+    -- Initialize an empty MVar to store the requests map
+    requestsVar <- newMVar Map.empty
+
+    -- Convert the set of nodes to a list for processing
+    let nodes = Set.toList v'
+
+    -- Fork threads to process nodes in parallel
+    forkThreads threadCount $ \threadId -> do
+        -- Each thread processes a chunk of nodes
+        forM_ (chunk threadCount threadId nodes) $ \node -> do
+            -- Get the current distance for this node
+            currentDist <- M.read distances node
+            -- Get outgoing edges and filter by predicate
+            let edges = G.out graph node
+            let filteredEdges = [(w, currentDist + d) | (_, w, d) <- edges, p d]
+            -- Update the requests map with the new tentative distances
+            modifyMVar_ requestsVar $ \requests ->
+                return $ foldr (\(w, newDist) -> Map.insertWith min w newDist) requests filteredEdges
+
+    -- Return the accumulated requests map
+    readMVar requestsVar
+  where
+    -- Helper function to split work among threads
+    chunk n t xs = [x | (i, x) <- zip [0 ..] xs, i `mod` n == t]
 
 
 -- Execute requests for each of the given (node, distance) pairs
@@ -167,7 +224,17 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
-  undefined
+    -- Convert the IntMap of requests into a list of (node, distance) pairs
+    let requests = Map.toList req
+
+    -- Process requests in parallel
+    forkThreads threadCount $ \threadId -> do
+        -- Each thread processes a chunk of requests
+        forM_ (chunk threadCount threadId requests) $ \(node, newDistance) ->
+            relax buckets distances delta (node, newDistance)
+  where
+    -- Helper function to split work among threads
+    chunk n t xs = [x | (i, x) <- zip [0 ..] xs, i `mod` n == t]
 
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
