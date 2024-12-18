@@ -62,40 +62,27 @@ type Distance = Float               -- Distances between nodes are (positive) fl
 -- other functions and data structures in this module as you require.
 --
 deltaStepping
-    :: Bool                             -- Whether to print intermediate states to the console, for debugging purposes
-    -> Graph                            -- graph to analyse
-    -> Distance                         -- delta (step width, bucket width)
-    -> Node                             -- index of the starting node
+    :: Bool
+    -> Graph
+    -> Distance
+    -> Node
     -> IO (Vector Distance)
 deltaStepping verbose graph delta source = do
-  threadCount <- getNumCapabilities             -- the number of (kernel) threads to use: the 'x' in '+RTS -Nx'
+    threadCount <- getNumCapabilities
+    (buckets, distances) <- initialise graph delta source
+    printVerbose verbose "initialise" graph delta buckets distances
 
-  -- Initialise the algorithm
-  (buckets, distances)  <- initialise graph delta source
-  printVerbose verbose "initialse" graph delta buckets distances
+    let loop :: Int -> IO ()
+        loop stepCount = do
+            done <- allBucketsEmpty buckets
+            unless done $ do
+                step verbose threadCount graph delta buckets distances
+                loop (stepCount + 1)
 
-  let
-    -- The algorithm loops while there are still non-empty buckets
-    loop = do
-      done <- allBucketsEmpty buckets
-      if done
-      then return ()
-      else do
-        printVerbose verbose "result" graph delta buckets distances
-        step verbose threadCount graph delta buckets distances
-        loop
-  loop
+    loop 0
+    printVerbose verbose "result" graph delta buckets distances
+    M.unsafeFreeze distances
 
-  printVerbose verbose "result" graph delta buckets distances
-  -- Once the tentative distances are finalised, convert into an immutable array
-  -- to prevent further updates. It is safe to use this "unsafe" function here
-  -- because the mutable vector will not be used any more, so referential
-  -- transparency is preserved for the frozen immutable vector.
-  --
-  -- NOTE: The function 'Data.Vector.convert' can be used to translate between
-  -- different (compatible) vector types (e.g. boxed to storable)
-  --
-  M.unsafeFreeze distances
 
 -- Initialise algorithm state
 --
@@ -162,11 +149,18 @@ step verbose threadCount graph delta buckets distances = do
 
 
 updateFirstBucketIndex :: Buckets -> IO ()
-updateFirstBucketIndex Buckets { firstBucket = firstBucket, bucketArray = bucketArray } = do
-    let bucketCount = V.length bucketArray -- Pure length calculation
-    forM_ [0 .. bucketCount - 1] $ \i -> do
-        bucket <- V.read bucketArray i
-        unless (Set.null bucket) $ writeIORef firstBucket i
+updateFirstBucketIndex Buckets{firstBucket = firstBucket, bucketArray = bucketArray} = do
+    bucketCount <- pure $ V.length bucketArray
+    start <- readIORef firstBucket
+    let loop i
+          | i == start + bucketCount = return () -- Stop after a full cycle
+          | otherwise = do
+              bucket <- V.read bucketArray (i `mod` bucketCount)
+              if Set.null bucket
+                  then loop (i + 1)
+                  else writeIORef firstBucket (i `mod` bucketCount)
+    loop start
+
 
 
 
@@ -187,18 +181,18 @@ allBucketsEmpty Buckets { firstBucket = firstBucket, bucketArray = bucketArray }
 -- least one non-empty bucket remaining.
 --
 findNextBucket :: Buckets -> IO Int
-findNextBucket Buckets { firstBucket = firstBucket, bucketArray = bucketArray } = do
+findNextBucket Buckets{firstBucket = firstBucket, bucketArray = bucketArray} = do
     start <- readIORef firstBucket
     let bucketCount = V.length bucketArray
     let indices = [start .. start + bucketCount - 1] -- Cyclic indices
-    -- Find the first non-empty bucket
-    let findIndex [] = error "No non-empty buckets found!" -- Safety check
-        findIndex (i:is) = do
+    let loop [] = error "No non-empty buckets found!"
+        loop (i:is) = do
             bucket <- V.read bucketArray (i `mod` bucketCount)
             if Set.null bucket
-                then findIndex is
-                else return i
-    findIndex indices
+                then loop is
+                else return (i `mod` bucketCount)
+    loop indices
+
 
 
 
@@ -212,30 +206,31 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph v' distances = do
-    -- Initialize an empty MVar to store the requests map
+    -- Initialize a shared queue and result map
+    workQueue <- newMVar (Set.toList v')
     requestsVar <- newMVar Map.empty
 
-    -- Convert the set of nodes to a list for processing
-    let nodes = Set.toList v'
-
-    -- Fork threads to process nodes in parallel
-    forkThreads threadCount $ \threadId -> do
-        -- Each thread processes a chunk of nodes
-        forM_ (chunk threadCount threadId nodes) $ \node -> do
-            -- Get the current distance for this node
-            currentDist <- M.read distances node
-            -- Get outgoing edges and filter by predicate
-            let edges = G.out graph node
-            let filteredEdges = [(w, currentDist + d) | (_, w, d) <- edges, p d]
-            -- Update the requests map with the new tentative distances
-            modifyMVar_ requestsVar $ \requests ->
-                return $ foldr (\(w, newDist) -> Map.insertWith min w newDist) requests filteredEdges
+    -- Each thread repeatedly grabs work from the queue
+    forkThreads threadCount $ \_ -> do
+        let processNode node = do
+                currentDist <- M.read distances node
+                let edges = G.out graph node
+                let filteredEdges = [(w, currentDist + d) | (_, w, d) <- edges, p d]
+                modifyMVar_ requestsVar $ \requests ->
+                    return $ foldr (\(w, newDist) -> Map.insertWith min w newDist) requests filteredEdges
+        let loop = do
+                nextWork <- modifyMVar workQueue $ \workQueueList ->
+                    case workQueueList of
+                        [] -> return ([], Nothing)
+                        (x:xs) -> return (xs, Just x)
+                case nextWork of
+                    Nothing -> return () -- No more work
+                    Just node -> processNode node >> loop
+        loop
 
     -- Return the accumulated requests map
     readMVar requestsVar
-  where
-    -- Helper function to split work among threads
-    chunk n t xs = [x | (i, x) <- zip [0 ..] xs, i `mod` n == t]
+
 
 
 -- Execute requests for each of the given (node, distance) pairs
@@ -264,30 +259,24 @@ relaxRequests threadCount buckets distances delta req = do
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
 --
-relax :: Buckets
-      -> TentativeDistances
-      -> Distance
-      -> (Node, Distance) -- (node, newDistance)
-      -> IO ()
-relax Buckets { firstBucket = firstBucket, bucketArray = bucketArray } distances delta (node, newDistance) = do
-    -- Read the current distance of the node
+relax
+    :: Buckets
+    -> TentativeDistances
+    -> Distance
+    -> (Node, Distance) -- (node, newDistance)
+    -> IO ()
+relax Buckets{firstBucket = firstBucket, bucketArray = bucketArray} distances delta (node, newDistance) = do
     currentDistance <- M.read distances node
-
-    -- Check if the new distance is smaller
     when (newDistance < currentDistance) $ do
-        -- Update the tentative distance
         M.write distances node newDistance
-
-        -- Compute the new bucket index
         let newBucketIndex = floor (newDistance / delta)
-
-        -- Remove the node from its current bucket (if applicable)
         let currentBucketIndex = floor (currentDistance / delta)
-        when (not $ isInfinite currentDistance) $ do
-            V.modify bucketArray (Set.delete node) (currentBucketIndex `mod` V.length bucketArray)
+        -- Skip moving the node if it remains in the same bucket
+        when (newBucketIndex /= currentBucketIndex || isInfinite currentDistance) $ do
+            when (not $ isInfinite currentDistance) $
+                V.modify bucketArray (Set.delete node) (currentBucketIndex `mod` V.length bucketArray)
+            V.modify bucketArray (Set.insert node) (newBucketIndex `mod` V.length bucketArray)
 
-        -- Add the node to the new bucket
-        V.modify bucketArray (Set.insert node) (newBucketIndex `mod` V.length bucketArray)
 
 
 
